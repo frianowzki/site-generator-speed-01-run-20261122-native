@@ -20,8 +20,14 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <math.h>
+#include <setjmp.h>
 
-static void die(const char *msg) { fprintf(stderr, "engine: %s\n", msg); exit(1); }
+// When built as a N-API addon (ENGINE_NAPI defined), die() longjmps back
+// to engine_build() instead of exiting the process, so the JS driver can
+// fall back to solve.js. As a standalone CLI binary, die() exits(1) as
+// before. engine_jmp is NULL outside an engine_build() call.
+static jmp_buf *engine_jmp = NULL;
+static void die(const char *msg) { if (engine_jmp) longjmp(*engine_jmp, 1); fprintf(stderr, "engine: %s\n", msg); exit(1); }
 static void *xmalloc(size_t n) { void *p = malloc(n ? n : 1); if (!p) die("oom"); return p; }
 static void *xrealloc(void *p, size_t n) { void *q = realloc(p, n ? n : 1); if (!q) die("oom"); return q; }
 
@@ -2470,13 +2476,20 @@ static char *read_file(const char *path, size_t *n) {
   *n = (size_t)sz;
   return buf;
 }
-int main(int argc, char **argv) {
-  if (argc != 4) { fprintf(stderr, "usage: engine <cases.json> <answers.json> <nfkd.bin>\n"); return 1; }
+// Core entry point, callable from main() (CLI) and from the N-API addon.
+// Returns 0 on success, 1 on any failure (a die() anywhere longjmps here
+// when built as an addon; as a CLI binary die() exits the process first).
+// Single-use per process: arenas are initialised once and not reset for a
+// second call (the driver calls it once, then exits or falls back to JS).
+int engine_build(const char *cases_path, const char *answers_path, const char *nfkd_path) {
+  jmp_buf jb;
+  engine_jmp = &jb;
+  if (setjmp(jb)) { engine_jmp = NULL; return 1; }
   arena_init(&perm_arena);
   arena_init(&case_arena);
-  nfkd_load(argv[3]);
+  nfkd_load(nfkd_path);
   size_t n;
-  char *raw = read_file(argv[1], &n);
+  char *raw = read_file(cases_path, &n);
   Val *cases = json_parse(&perm_arena, raw, n);
   if (!cases || cases->t != VARR) die("cases.json is not an array");
   ByteBuf out; bbuf_init(&out);
@@ -2499,12 +2512,20 @@ int main(int argc, char **argv) {
     bbuf_addc(&out, '}');
   }
   bbuf_addc(&out, ']');
-  FILE *f = fopen(argv[2], "wb");
+  FILE *f = fopen(answers_path, "wb");
   if (!f) die("cannot open output file");
   if (out.n && fwrite(out.p, 1, out.n, f) != out.n) die("cannot write output file");
   fclose(f);
+  engine_jmp = NULL;
   return 0;
 }
+
+#ifndef ENGINE_NAPI
+int main(int argc, char **argv) {
+  if (argc != 4) { fprintf(stderr, "usage: engine <cases.json> <answers.json> <nfkd.bin>\n"); return 1; }
+  return engine_build(argv[1], argv[2], argv[3]);
+}
+#endif
 
 // ---------------------------------------------------------------- front matter
 static bool str_is_ascii(Str s, const char *c) { // exact match against an ASCII literal
